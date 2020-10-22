@@ -10,38 +10,41 @@
 #include <sof/math/numbers.h>
 #include <math.h>
 
-/* Add definitions for fixed-point math function usage */
-#define DRC_FIXED_DB2LIN
-#define DRC_FIXED_LIN2DB
-#define DRC_FIXED_LOG10
-#define DRC_FIXED_LOGF
-#define DRC_FIXED_SIN
-#define DRC_FIXED_ASIN
-#define DRC_FIXED_POW
-#define DRC_FIXED_EXP
-
-#define DRC_PI_FLOAT 3.141592653589793f
-#define DRC_PI_OVER_TWO_FLOAT 1.57079632679489661923f
-#define DRC_TWO_OVER_PI_FLOAT 0.63661977236758134f
-#define DRC_ONE_OVER_SQRT2 0.70710678118654752f
-
-inline float decibels_to_linear(float decibels)
+inline int32_t decibels_to_linear(int32_t decibels)
 {
-#ifdef DRC_FIXED_DB2LIN
 /*
  * Input is Q8.24: max 128.0
  * Output is Q12.20: max 2048.0
  */
-	return Q_CONVERT_QTOF(db2lin_fixed(Q_CONVERT_FLOAT(decibels, 24)), 20);
-#else
-	/* 10^(x/20) = e^(x * log(10^(1/20))) */
-	return expf(0.1151292546497022f * decibels);
-#endif
+	return db2lin_fixed(decibels);
 }
 
-static inline float warp_log10f(float x)
+static inline int32_t warp_rexp(int32_t x, int precision_x, int *e)
 {
-#ifdef DRC_FIXED_LOG10
+/*
+ * Input depends on precision_x
+ * Output range [0.5, 1); regulated to Q2.30
+ */
+	int bit;
+	int32_t bitmask = 0x40000000;
+
+	for (bit = 31; bit > 0; bit--) {
+		if (x & bitmask)
+			break;
+		bitmask >>= 1;
+	}
+
+	*e = bit - precision_x;
+
+	if (bit > 30)
+		return Q_SHIFT_RND(x, bit, 30);
+	if (bit < 30)
+		return Q_SHIFT_LEFT(x, bit, 30);
+	return x;
+}
+
+static inline int32_t warp_log10(int32_t x)
+{
 /*
  * Input is Q6.26: max 32.0
  * Output range ~ (-inf, 1.505); regulated to Q6.26: (-32.0, 32.0)
@@ -52,9 +55,7 @@ static inline float warp_log10f(float x)
 	 * fpminimax(log10(x), 5, [|SG...|], [1/2;sqrt(2)/2], absolute);
 	 * max err ~= 6.088e-8
 	 */
-	const int32_t HALF_Q_V = Q_CONVERT_FLOAT(0.5f, q_v);
-	const int32_t ONE_Q_V = Q_CONVERT_FLOAT(1.0f, q_v);
-	const int32_t ONE_OVER_SQRT2 = Q_CONVERT_FLOAT(DRC_ONE_OVER_SQRT2, q_v);
+	const int32_t ONE_OVER_SQRT2 = Q_CONVERT_FLOAT(0.70710678118654752f, 30); /* 1/sqrt(2) */
 	const int32_t A5 = Q_CONVERT_FLOAT(1.131880283355712890625f, q_v);
 	const int32_t A4 = Q_CONVERT_FLOAT(-4.258677959442138671875f, q_v);
 	const int32_t A3 = Q_CONVERT_FLOAT(6.81631565093994140625f, q_v);
@@ -62,90 +63,60 @@ static inline float warp_log10f(float x)
 	const int32_t A1 = Q_CONVERT_FLOAT(3.6505267620086669921875f, q_v);
 	const int32_t A0 = Q_CONVERT_FLOAT(-1.217894077301025390625f, q_v);
 	const int32_t LOG10_2 = Q_CONVERT_FLOAT(0.301029995663981195214f, q_v);
-	int32_t x_fixed = Q_CONVERT_FLOAT(x, q_v);
-	int32_t e; /* Q31.1 */
+	int e;
+	int32_t exp; /* Q31.1 */
 	int32_t x2, x4; /* Q2.30 */
 	int32_t A5Xx, A3Xx;
-	int bit;
-	int32_t bitmask = 0x40000000;
 
-	/* frexpf(x, &e) implementation:
-	 * The goal is to adjust x into range [0.5, 1.0) with precision q_v by shiftings. In order
-	 * words, bit[q_v-1] should be the right-most 1 for x. So first we find the bit location of
-	 * the right-most 1 for original x, then calculate e by the distance from q_v and perform
-	 * the shifting.
-	 */
-	for (bit = 31; bit > 0; bit--) {
-		if (x_fixed & bitmask)
-			break;
-		bitmask >>= 1;
-	}
-	if (bit > q_v)
-		x_fixed = Q_SHIFT_RND(x_fixed, bit, q_v);
-	else if (bit < q_v)
-		x_fixed = Q_SHIFT_LEFT(x_fixed, bit, q_v);
-	e = (bit - q_v) << 1; /* Q_CONVERT_FLOAT(bit - q_v, 1) */
+	x = warp_rexp(x, 26, &e); /* Q2.30 */
+	exp = (int32_t)e << 1; /* Q_CONVERT_FLOAT(e, 1) */
 
-	if (x_fixed > ONE_OVER_SQRT2) {
-		x_fixed = q_mult(x_fixed, ONE_OVER_SQRT2, q_v, q_v, q_v);
-		e += 1; /* Q_CONVERT_FLOAT(0.5, 1); */
+	if (x > ONE_OVER_SQRT2) {
+		x = q_mult(x, ONE_OVER_SQRT2, 30, 30, 30);
+		exp += 1; /* Q_CONVERT_FLOAT(0.5, 1) */
 	}
 
-	x2 = q_mult(x_fixed, x_fixed, q_v, q_v, 30);
+	x2 = q_mult(x, x, 30, 30, 30);
 	x4 = q_mult(x2, x2, 30, 30, 30);
-	A5Xx = q_mult(A5, x_fixed, q_v, q_v, q_v);
-	A3Xx = q_mult(A3, x_fixed, q_v, q_v, q_v);
-	return Q_CONVERT_QTOF(
-		(q_mult((A5Xx + A4), x4, q_v, 30, q_v)
-			+ q_mult((A3Xx + A2), x2, q_v, 30, q_v)
-				+ q_mult(A1, x_fixed, q_v, q_v, q_v) + A0
-					+ q_mult(e, LOG10_2, 1, q_v, q_v)), q_v);
+	A5Xx = q_mult(A5, x, q_v, 30, q_v);
+	A3Xx = q_mult(A3, x, q_v, 30, q_v);
+	return q_mult((A5Xx + A4), x4, q_v, 30, q_v) + q_mult((A3Xx + A2), x2, q_v, 30, q_v)
+		+ q_mult(A1, x, q_v, 30, q_v) + A0 + q_mult(exp, LOG10_2, 1, q_v, q_v);
 #undef q_mult
 #undef q_v
-#else
-	return log10f(x);
-#endif
 }
 
-inline float linear_to_decibels(float linear)
+inline int32_t linear_to_decibels(int32_t linear)
 {
-	/* For negative or zero, just return a very small dB value. */
-	if (linear <= 0)
-		return -1000;
-	if (isbadf(linear))
-		return linear;
-#ifdef DRC_FIXED_LIN2DB
 /*
  * Input is Q6.26: max 32.0
  * Output range ~ (-inf, 30.1030); regulated to Q11.21: (-1024.0, 1024.0)
  */
-	int32_t log10_linear = Q_CONVERT_FLOAT(warp_log10f(linear), 26);
-	return Q_CONVERT_QTOF(Q_MULTSR_32X32((int64_t)20, log10_linear, 0, 26, 21), 21);
-#else
-	/* 20 * log10(x) = 20 / log(10) * log(x) */
-	return 8.6858896380650366f * logf(linear);
-#endif
+	/* For negative or zero, just return a very small dB value. */
+	if (linear <= 0)
+		return Q_CONVERT_FLOAT(-1000.0f, 21);
+
+	int32_t log10_linear = warp_log10(linear); /* Q6.26 */
+	return Q_MULTSR_32X32((int64_t)20, log10_linear, 0, 26, 21);
 }
 
-inline float warp_logf(float x)
+inline int32_t warp_log(int32_t x)
 {
-#ifdef DRC_FIXED_LOGF
 /*
  * Input is Q6.26: max 32.0
  * Output range ~ (-inf, 3.4657); regulated to Q6.26: (-32.0, 32.0)
  */
+	if (x <= 0)
+		return Q_CONVERT_FLOAT(-30.0f, 26);
+
 	/* log(x) = log(10) * log10(x) */
 	const int32_t LOG10 = Q_CONVERT_FLOAT(2.3025850929940457f, 29);
-	int32_t log10_x = Q_CONVERT_FLOAT(warp_log10f(x), 26);
-	return Q_CONVERT_QTOF(Q_MULTSR_32X32((int64_t)LOG10, log10_x, 29, 26, 26), 26);
-#else
-	return logf(x);
-#endif
+	int32_t log10_x = warp_log10(x); /* Q6.26 */
+	return Q_MULTSR_32X32((int64_t)LOG10, log10_x, 29, 26, 26);
 }
 
-inline float warp_sinf(float x)
+inline int32_t warp_sin(int32_t x)
 {
-#ifdef DRC_FIXED_SIN
 /*
  * Input is Q2.30: (-2.0, 2.0)
  * Output range: [-1.0, 1.0]; regulated to Q2.30: (-2.0, 2.0)
@@ -160,24 +131,19 @@ inline float warp_sinf(float x)
 	const int32_t A5 = Q_CONVERT_FLOAT(7.9434238374233245849609375e-2f, q_v);
 	const int32_t A3 = Q_CONVERT_FLOAT(-0.645892798900604248046875f, q_v);
 	const int32_t A1 = Q_CONVERT_FLOAT(1.5707910060882568359375f, q_v);
-	int32_t x_fixed = Q_CONVERT_FLOAT(x, q_v);
-	int32_t x2 = q_multv(x_fixed, x_fixed);
+	int32_t x2 = q_multv(x, x);
 	int32_t x4 = q_multv(x2, x2);
 
 	int32_t A3Xx2 = q_multv(A3, x2);
 	int32_t A7Xx2 = q_multv(A7, x2);
 
-	return Q_CONVERT_QTOF(q_multv(x_fixed, (q_multv(x4, (A7Xx2 + A5)) + A3Xx2 + A1)), q_v);
+	return q_multv(x, (q_multv(x4, (A7Xx2 + A5)) + A3Xx2 + A1));
 #undef q_multv
 #undef q_v
-#else
-	return sinf(DRC_PI_OVER_TWO_FLOAT * x);
-#endif
 }
 
-inline float warp_asinf(float x)
+inline int32_t warp_asin(int32_t x)
 {
-#ifdef DRC_FIXED_ASIN
 /*
  * Input is Q2.30: (-2.0, 2.0)
  * Output range: [-1.0, 1.0]; regulated to Q2.30: (-2.0, 2.0)
@@ -193,8 +159,8 @@ inline float warp_asinf(float x)
 	 *   fpminimax(asin(x), [|1,3,5,7|], [|SG...|], [1/sqrt(2);1], absolute)
 	 *   max err ~= 3.085226e-2
 	 */
-	const int32_t TWO_OVER_PI = Q_CONVERT_FLOAT(DRC_TWO_OVER_PI_FLOAT, q_vl);
-	const int32_t ONE_OVER_SQRT2 = Q_CONVERT_FLOAT(DRC_ONE_OVER_SQRT2, q_vl);
+	const int32_t TWO_OVER_PI = Q_CONVERT_FLOAT(0.63661977236758134f, q_vl); /* 2/pi */
+	const int32_t ONE_OVER_SQRT2 = Q_CONVERT_FLOAT(0.70710678118654752f, q_vl); /* 1/sqrt(2) */
 	const int32_t A7L = Q_CONVERT_FLOAT(0.1181826665997505187988281f, q_vl);
 	const int32_t A5L = Q_CONVERT_FLOAT(4.0224377065896987915039062e-2f, q_vl);
 	const int32_t A3L = Q_CONVERT_FLOAT(0.1721895635128021240234375f, q_vl);
@@ -209,9 +175,7 @@ inline float warp_asinf(float x)
 	int32_t x2, x4;
 	int32_t A3Xx2, A7Xx2, asinx;
 
-	int32_t x_fixed = Q_CONVERT_FLOAT(x, q_vl);
-
-	if (ABS(x_fixed) <= ONE_OVER_SQRT2) {
+	if (ABS(x) <= ONE_OVER_SQRT2) {
 		A7 = A7L;
 		A5 = A5L;
 		A3 = A3L;
@@ -223,56 +187,87 @@ inline float warp_asinf(float x)
 		A3 = A3H;
 		A1 = A1H;
 		q_v = q_vh;
-		x_fixed = Q_SHIFT_RND(x_fixed, q_vl, q_vh);
+		x = Q_SHIFT_RND(x, q_vl, q_vh); /* Q6.26 */
 	}
 
-	x2 = q_multv(x_fixed, x_fixed, q_v);
+	x2 = q_multv(x, x, q_v);
 	x4 = q_multv(x2, x2, q_v);
 
 	A3Xx2 = q_multv(A3, x2, q_v);
 	A7Xx2 = q_multv(A7, x2, q_v);
 
-	asinx = q_multv(x_fixed, (q_multv(x4, (A7Xx2 + A5), q_v) + A3Xx2 + A1), q_v);
-	return Q_CONVERT_QTOF(Q_MULTSR_32X32((int64_t)asinx, TWO_OVER_PI, q_v, q_vl, q_vl), q_vl);
+	asinx = q_multv(x, (q_multv(x4, (A7Xx2 + A5), q_v) + A3Xx2 + A1), q_v);
+	return Q_MULTSR_32X32((int64_t)asinx, TWO_OVER_PI, q_v, q_vl, 30);
 #undef q_multv
 #undef q_vh
 #undef q_vl
-#else
-	return asinf(x) * DRC_TWO_OVER_PI_FLOAT;
-#endif
 }
 
-inline float warp_powf(float x, float y)
+inline int32_t warp_pow(int32_t x, int32_t y)
 {
-#ifdef DRC_FIXED_POW
 /*
  * Input x is Q6.26: (-32.0, 32.0)
  *       y is Q2.30: (-2.0, 2.0)
  * Output is Q12.20: max 2048.0
  */
-	/* x^y = expf(y * logf(x)) */
-	int32_t y_fixed = Q_CONVERT_FLOAT(y, 30);
-	int32_t logx_fixed = Q_CONVERT_FLOAT(warp_logf(x), 26);
-	return Q_CONVERT_QTOF(exp_fixed(Q_MULTSR_32X32((int64_t)y_fixed, logx_fixed, 30, 26, 27)), 20);
-#else
-	return powf(x, y);
-#endif
+	/* x^y = expf(y * log(x)) */
+	return exp_fixed(Q_MULTSR_32X32((int64_t)y, warp_log(x), 30, 26, 27));
 }
 
-inline float knee_expf(float input)
+inline int32_t warp_inv(int32_t x, int precision_x, int precision_y)
 {
-#ifdef DRC_FIXED_EXP
+#define q_v 25
+#define q_mult(a, b, qa, qb, qy) ((int32_t)Q_MULTSR_32X32((int64_t)a, b, qa, qb, qy))
+	/* Coefficients obtained from:
+	 * fpminimax(1/x, 5, [|SG...|], [sqrt(2)/2;1], absolute);
+	 * max err ~= 1.00388e-6
+	 */
+	const int32_t ONE_OVER_SQRT2 = Q_CONVERT_FLOAT(0.70710678118654752f, 30); /* 1/sqrt(2) */
+	const int32_t SQRT2 = Q_CONVERT_FLOAT(1.4142135623730950488f, 30); /* sqrt(2) */
+	const int32_t A5 = Q_CONVERT_FLOAT(-2.742647647857666015625f, q_v);
+	const int32_t A4 = Q_CONVERT_FLOAT(14.01327800750732421875f, q_v);
+	const int32_t A3 = Q_CONVERT_FLOAT(-29.74465179443359375f, q_v);
+	const int32_t A2 = Q_CONVERT_FLOAT(33.57208251953125f, q_v);
+	const int32_t A1 = Q_CONVERT_FLOAT(-21.25031280517578125f, q_v);
+	const int32_t A0 = Q_CONVERT_FLOAT(7.152250766754150390625f, q_v);
+	int e;
+	int sqrt2_extracted = 0;
+	int32_t x2, x4; /* Q2.30 */
+	int32_t A5Xx, A3Xx;
+	int32_t inv;
+
+	x = warp_rexp(x, precision_x, &e); /* Q2.30 */
+
+	if (x < ONE_OVER_SQRT2) {
+		x = q_mult(x, SQRT2, 30, 30, 30);
+		sqrt2_extracted = 1;
+	}
+
+	x2 = q_mult(x, x, 30, 30, 30);
+	x4 = q_mult(x2, x2, 30, 30, 30);
+	A5Xx = q_mult(A5, x, q_v, 30, q_v);
+	A3Xx = q_mult(A3, x, q_v, 30, q_v);
+	inv = q_mult((A5Xx + A4), x4, q_v, 30, q_v) + q_mult((A3Xx + A2), x2, q_v, 30, q_v)
+		+ q_mult(A1, x, q_v, 30, q_v) + A0;
+
+	if (sqrt2_extracted)
+		inv = q_mult(inv, SQRT2, q_v, 30, q_v);
+
+	e += q_v;
+	if (e > precision_y)
+		return Q_SHIFT_RND(inv, e, precision_y);
+	if (e < precision_y)
+		return Q_SHIFT_LEFT(inv, e, precision_y);
+	return inv;
+#undef q_mult
+#undef q_v
+}
+
+inline int32_t knee_exp(int32_t input)
+{
 /*
  * Input is Q5.27: max 16.0
  * Output is Q12.20: max 2048.0
  */
-	return Q_CONVERT_QTOF(exp_fixed(Q_CONVERT_FLOAT(input, 27)), 20);
-#else
-	return expf(input);
-#endif
-}
-
-inline int isbadf(float x)
-{
-	return x != 0 && !isnormal(x);
+	return exp_fixed(input);
 }
